@@ -75,40 +75,108 @@ def download_pdf(blob_service_client, document_id, local_path):
 
 def process_with_olmocr(pdf_path, output_dir):
     """Run olmOCR on the PDF file."""
+    # Ensure the output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     cmd = [
         'python', '-m', 'olmocr.pipeline',
         str(output_dir),
         '--markdown',
-        '--pdfs', str(pdf_path)
+        '--pdfs', str(pdf_path),
+        '--workers', '1'  # Use single worker for debugging
     ]
     
-    print(f"Running olmOCR: {' '.join(cmd)}")
+    print(f"Running olmOCR command:")
+    print(f"  {' '.join(cmd)}")
+    print(f"  PDF exists: {pdf_path.exists()}")
+    print(f"  PDF size: {pdf_path.stat().st_size} bytes")
+    print(f"  Output dir exists: {output_dir.exists()}")
     
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=VISIBILITY_TIMEOUT - 60  # Leave 1 minute buffer
-    )
+    # Run without timeout first to see if it completes
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=VISIBILITY_TIMEOUT - 60
+        )
+    except subprocess.TimeoutExpired as e:
+        print(f"olmOCR timed out after {VISIBILITY_TIMEOUT - 60} seconds")
+        print(f"Stdout so far: {e.stdout}")
+        print(f"Stderr so far: {e.stderr}")
+        raise
+    
+    # Print full output for debugging
+    if result.stdout:
+        print(f"olmOCR stdout:\n{result.stdout}")
+    if result.stderr:
+        print(f"olmOCR stderr:\n{result.stderr}")
+    print(f"olmOCR return code: {result.returncode}")
     
     if result.returncode != 0:
-        raise Exception(f"olmOCR failed: {result.stderr}")
+        raise Exception(f"olmOCR failed with return code {result.returncode}")
     
     print(f"olmOCR completed successfully")
+    
+    # List all files created in output directory
+    print(f"\nFiles in output directory after olmOCR:")
+    for root, dirs, files in os.walk(output_dir):
+        level = root.replace(str(output_dir), '').count(os.sep)
+        indent = ' ' * 2 * level
+        print(f"{indent}{os.path.basename(root)}/")
+        subindent = ' ' * 2 * (level + 1)
+        for file in files:
+            file_path = os.path.join(root, file)
+            size = os.path.getsize(file_path)
+            print(f"{subindent}{file} ({size} bytes)")
+    
     return True
 
-def upload_markdown(blob_service_client, document_id, markdown_dir):
+def upload_markdown(blob_service_client, document_id, output_dir):
     """Upload markdown result to blob storage."""
-    # Find the generated markdown file
-    markdown_files = list(Path(markdown_dir).glob('**/*.md'))
+    markdown_dir = output_dir / "markdown"
+    
+    print(f"Looking for markdown files...")
+    print(f"Markdown directory path: {markdown_dir}")
+    print(f"Output directory path: {output_dir}")
+    
+    # List everything in the output directory
+    print(f"Contents of output directory:")
+    for item in output_dir.rglob('*'):
+        print(f"  {item.relative_to(output_dir)} ({'dir' if item.is_dir() else 'file'})")
+    
+    # Try multiple locations for markdown files
+    possible_locations = [
+        markdown_dir.glob('*.md'),  # Direct .md files in markdown dir
+        markdown_dir.glob('**/*.md'),  # Recursive search in markdown dir
+        output_dir.glob('*.md'),  # Direct .md files in output dir
+        output_dir.rglob('*.md'),  # Recursive search in entire output
+        output_dir.parent.rglob('*.md'),  # Check parent directory too
+    ]
+    
+    markdown_files = []
+    for location in possible_locations:
+        files = list(location)
+        if files:
+            print(f"Found markdown files at {location}: {files}")
+            markdown_files.extend(files)
+            break
     
     if not markdown_files:
-        raise Exception("No markdown file generated")
+        # Check for JSONL files (Dolma format) as fallback
+        jsonl_files = list(output_dir.rglob('*.jsonl'))
+        if jsonl_files:
+            print(f"No .md files found, but found JSONL files: {jsonl_files}")
+            print("Note: olmOCR might be outputting Dolma format instead of markdown")
+            raise Exception("No markdown file generated - found JSONL instead. May need to adjust olmOCR parameters.")
+        else:
+            raise Exception("No markdown or JSONL files generated")
     
     # Use the first markdown file found
     markdown_path = markdown_files[0]
-    blob_name = f"{document_id}.md"
+    print(f"Using markdown file: {markdown_path}")
     
+    blob_name = f"{document_id}.md"
     blob_client = blob_service_client.get_blob_client(
         container=OUTPUT_CONTAINER,
         blob=blob_name
@@ -172,9 +240,8 @@ def process_message(blob_service_client, message_content):
             # Process with olmOCR
             process_with_olmocr(pdf_path, output_dir)
             
-            # Upload result
-            markdown_dir = output_dir / "markdown"
-            upload_markdown(blob_service_client, document_id, markdown_dir)
+            # Upload result - pass the output_dir, not markdown_dir
+            upload_markdown(blob_service_client, document_id, output_dir)
             
             print(f"Successfully processed {document_id}")
             return True
