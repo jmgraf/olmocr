@@ -52,14 +52,38 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /build          
 COPY . /build
 
-
 # Needed to resolve setuptools dependencies
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
+
+# Install olmOCR and dependencies
 RUN uv pip install --system --no-cache ".[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
 RUN uv pip install --system https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.6.post1%2Bcu128torch2.7-cp39-abi3-linux_x86_64.whl
 RUN uv pip install --system --no-cache ".[bench]"
-
 RUN playwright install-deps
 RUN playwright install chromium
 
+# Install Azure Storage SDK
+RUN uv pip install --system azure-storage-blob azure-storage-queue
+
+# Verify olmOCR installation
 RUN python3 -m olmocr.pipeline --help
+
+# Create application directory
+WORKDIR /app
+
+# Copy the queue processor script
+COPY queue_processor.py /app/queue_processor.py
+RUN chmod +x /app/queue_processor.py
+
+# Set environment variables (these will be overridden at runtime)
+ENV AZURE_CONNECTION_STRING=""
+ENV QUEUE_NAME="pdf-processing-queue"
+ENV VISIBILITY_TIMEOUT="600"
+ENV POLL_INTERVAL="5"
+
+# Health check (optional)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import sys; sys.exit(0)"
+
+# Run the queue processor
+ENTRYPOINT ["python3", "/app/queue_processor.py"]
